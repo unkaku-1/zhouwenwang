@@ -14,7 +14,10 @@ import { getDefaultServerUrl } from '../utils/url';
  * 默认设置配置
  */
 export const DEFAULT_SETTINGS: Settings = {
+  provider: 'gemini',
   apiKey: '',
+  providerApiKey: '',
+  providerModel: '',
   sidebarCollapsed: false,
   serverUrl: getDefaultServerUrl(),
 };
@@ -40,6 +43,17 @@ export function validateSettings(settings: any): settings is Settings {
 
   // 检查可选字段
   if (settings.serverUrl !== undefined && typeof settings.serverUrl !== 'string') {
+    return false;
+  }
+
+  // 新增 provider 字段 (向后兼容: 旧 settings 没有这个字段,默认 gemini)
+  if (settings.provider !== undefined && settings.provider !== 'gemini' && settings.provider !== 'minimax') {
+    return false;
+  }
+  if (settings.providerApiKey !== undefined && typeof settings.providerApiKey !== 'string') {
+    return false;
+  }
+  if (settings.providerModel !== undefined && typeof settings.providerModel !== 'string') {
     return false;
   }
 

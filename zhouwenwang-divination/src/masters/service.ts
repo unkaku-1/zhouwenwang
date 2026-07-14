@@ -18,6 +18,7 @@ import {
   hasValidApiKey
 } from './config';
 import { getGamePrompt, isGameTypeSupported } from './prompts';
+import { getProvider as getProviderCfg, buildDirectChatUrl, type LLMProviderConfig } from './providers';
 
 // 🚀 流式响应控制开关 - 在这里修改即可控制全局行为
 const ENABLE_STREAMING = false; // true: 使用SSE流式API, false: 使用标准API+前端模拟流式效果
@@ -476,6 +477,224 @@ async function getServerStreamAnalysis(
   return accumulatedText.trim();
 }
 
+// ---------------------------------------------------------------------------
+// Multi-provider support (added in feature/minimax-provider)
+// ---------------------------------------------------------------------------
+// These functions mirror the legacy /api/gemini/* helpers above but route
+// through /api/llm/*, which the backend (backend/routes/llm.js) dispatches
+// to the right upstream based on the `provider` field. They always return
+// Gemini-shaped responses so the rest of the file keeps working unchanged.
+// ---------------------------------------------------------------------------
+
+/**
+ * Standard (non-streaming) provider-routed call. The response is parsed
+ * as Gemini-shaped: { candidates: [{ content: { parts: [{ text }] } }] }.
+ */
+async function getServerRoutedStandardAnalysis(
+  serverUrl: string,
+  prompt: string,
+  providerId: string,
+  apiKey: string,
+  model: string
+): Promise<string> {
+  const response = await fetch(`${serverUrl.replace(/\/$/, '')}/api/llm/generate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      provider: providerId,
+      apiKey: apiKey || undefined,
+      model,
+      contents: [{ role: 'user', parts: [{ text: prompt }] }],
+      generationConfig: {
+        temperature: 0.7,
+        topP: 1,
+        maxOutputTokens: 4096,
+      },
+    }),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    let errMsg = `服务器API调用失败: HTTP ${response.status}`;
+    try {
+      const errJson = JSON.parse(errText);
+      if (errJson && errJson.error) errMsg = `服务器API调用失败: ${errJson.error}`;
+    } catch {
+      if (errText) errMsg = `服务器API调用失败: ${response.status} ${errText.slice(0, 200)}`;
+    }
+    throw new Error(errMsg);
+  }
+
+  const data = await response.json();
+  if (data && typeof data.text === 'string' && data.text.trim()) {
+    return data.text.trim();
+  }
+  // Back-compat: parse Gemini-shaped envelope
+  if (data && data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
+    return data.candidates[0].content.parts[0].text.trim();
+  }
+  throw new Error('服务器未返回有效数据');
+}
+
+/**
+ * Stream-routed provider call. Emits a stream of `data: {content, done}` events.
+ */
+async function getServerRoutedStreamAnalysis(
+  serverUrl: string,
+  prompt: string,
+  providerId: string,
+  apiKey: string,
+  model: string,
+  onUpdate?: (text: string) => void
+): Promise<string> {
+  const response = await fetch(`${serverUrl.replace(/\/$/, '')}/api/llm/stream`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      provider: providerId,
+      apiKey: apiKey || undefined,
+      model,
+      prompt,
+      maxTokens: 4096,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`服务器流式API调用失败: HTTP ${response.status}`);
+  }
+  if (!response.body) {
+    throw new Error('无法获取响应流');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let accumulatedText = '';
+  let lastSentLength = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      const chunkStr = decoder.decode(value, { stream: true });
+      const lines = chunkStr.split('\n');
+      for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine.startsWith('data: ')) continue;
+        const jsonStr = trimmedLine.slice(6);
+        if (jsonStr === '[DONE]') continue;
+        try {
+          const data = JSON.parse(jsonStr);
+          if (data.done === true) continue;
+          if (data.error) throw new Error(`后端服务器错误: ${data.error}`);
+          if (typeof data.content === 'string' && data.content.length > 0) {
+            // SSE emits full text in a single delta; if the backend ever
+            // moves to true token-level deltas, this will Just Work.
+            accumulatedText = data.content;
+            if (onUpdate && accumulatedText.length !== lastSentLength) {
+              onUpdate(accumulatedText);
+              lastSentLength = accumulatedText.length;
+            }
+          }
+        } catch (parseError) {
+          if (parseError instanceof Error && parseError.message.startsWith('后端服务器错误')) {
+            throw parseError;
+          }
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return accumulatedText.trim();
+}
+
+/**
+ * Direct (browser-side) call to a provider's chat API. Used when the user
+ * has no backend server configured. ONLY safe for providers whose
+ * `directBaseUrl` allows browser CORS — MiniMax does NOT (no permissive
+ * CORS), so this path is intentionally not used for MiniMax in production.
+ * We keep it for the case where the user runs the backend's CORS proxy
+ * (or for providers like Gemini which do allow CORS).
+ */
+async function getDirectProviderAnalysis(
+  provider: LLMProviderConfig,
+  apiKey: string,
+  prompt: string,
+  model: string,
+  onUpdate?: (text: string) => void
+): Promise<string> {
+  const url = buildDirectChatUrl(provider, model);
+  const body = provider.buildDirectRequest({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.7, topP: 1, maxOutputTokens: 4096 },
+    model,
+  });
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...provider.directAuthHeader(apiKey),
+    },
+  });
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    throw new Error(`直连 ${provider.displayName} 失败: HTTP ${response.status} ${errText.slice(0, 200)}`);
+  }
+  const data = await response.json();
+  const text = provider.extractDirectText(data) || '';
+  if (!text) throw new Error(`${provider.displayName} 返回数据为空`);
+  if (onUpdate) onUpdate(text);
+  return text.trim();
+}
+
+/**
+ * Pick the user's effective API key for the active provider. Falls back to
+ * the legacy `apiKey` field if `providerApiKey` is empty (back-compat).
+ */
+function resolveEffectiveApiKey(state: { settings: { provider?: string; apiKey: string; providerApiKey?: string } }): string {
+  const s = state.settings;
+  const providerId = s.provider || 'gemini';
+  if (providerId === 'gemini') return (s.providerApiKey || s.apiKey || '').trim();
+  return (s.providerApiKey || '').trim();
+}
+
+/**
+ * Resolve the active provider and model from settings. Falls back to
+ * gemini + the gemini default model when nothing is set.
+ */
+function resolveActiveProvider(): { provider: LLMProviderConfig; apiKey: string; model: string } {
+  const state = useAppStore.getState();
+  const provider = getProviderCfg(state.settings.provider);
+  const apiKey = resolveEffectiveApiKey(state);
+  const model = (state.settings.providerModel || '').trim() || provider.defaultModel;
+  return { provider, apiKey, model };
+}
+
+/**
+ * Pick the right server analysis function. The new routed paths handle
+ * any provider; we always use them when a serverUrl is configured. We
+ * fall back to the legacy /api/gemini/* path only for the gemini default
+ * to preserve the existing SSE-parsing behavior of the original code.
+ */
+async function callServerAnalysis(
+  serverUrl: string,
+  prompt: string,
+  enableStreaming: boolean,
+  onUpdate?: (text: string) => void
+): Promise<string> {
+  const { provider, apiKey, model } = resolveActiveProvider();
+  if (enableStreaming) {
+    return await getServerRoutedStreamAnalysis(serverUrl, prompt, provider.id, apiKey, model, onUpdate);
+  }
+  return await getServerRoutedStandardAnalysis(serverUrl, prompt, provider.id, apiKey, model);
+}
+
 /**
  * 获取AI流式分析结果（支持后端服务器和降级处理）
  * @param divinationData 占卜数据
@@ -510,14 +729,14 @@ export async function getAIAnalysisStream(
     
     // 4. 如果配置了服务器URL，优先使用后端服务器
     if (serverUrl && serverUrl.trim()) {
-      
+
       try {
         // 检查服务器健康状态
         const isServerHealthy = await checkServerHealth(serverUrl);
-        
+
         if (isServerHealthy) {
           console.log(`使用${enableStreaming ? '流式' : '标准'}后端服务器API...`);
-          return await getServerAnalysis(serverUrl, prompt, enableStreaming, onUpdate);
+          return await callServerAnalysis(serverUrl, prompt, enableStreaming, onUpdate);
         } else {
           console.warn('后端服务器健康检查失败，降级到直接API调用');
         }
@@ -525,135 +744,51 @@ export async function getAIAnalysisStream(
         console.warn('后端服务器调用失败，降级到直接API调用:', serverError);
       }
     }
-    
-    // 5. 降级到直接调用Gemini API
-    console.log('使用直接Gemini API调用...');
-    
-    // 验证API密钥（只有在没有可用服务器时才强制要求）
-    const effectiveApiKey = getActiveApiKey(apiKey);
-    if (!hasValidApiKey(apiKey)) {
+
+    // 5. 降级到直接API调用 — 路由根据当前 provider 选择
+    const { provider: activeProvider, apiKey: activeApiKey, model: activeModel } = resolveActiveProvider();
+    console.log(`使用直接${activeProvider.displayName} API调用...`);
+
+    // 验证API密钥
+    if (!activeApiKey || !activeProvider.isValidApiKeyFormat(activeApiKey)) {
       if (serverUrl && serverUrl.trim()) {
-        throw new Error('后端服务器不可用，且未配置有效的Gemini API密钥。请检查服务器状态或配置API密钥。');
+        throw new Error(`后端服务器不可用，且未配置有效的 ${activeProvider.displayName} API 密钥。请检查服务器状态或配置 API 密钥。`);
       } else {
-        throw new Error('请先在设置中配置有效的Gemini API密钥');
+        throw new Error(`请先在设置中配置有效的 ${activeProvider.displayName} API 密钥`);
       }
     }
-    
+
     try {
-      // 尝试直接流式API
-      const streamUrl = buildGeminiApiUrl(GEMINI_CONFIG.MODELS.PRIMARY, effectiveApiKey, 'streamGenerateContent');
-      
-      const requestBody = {
-        contents: [
-          {
-            parts: [
-              {
-                text: prompt
-              }
-            ]
-          }
-        ],
-        generationConfig: GEMINI_CONFIG.GENERATION_CONFIG
-      };
-      
-      console.log('正在尝试Gemini流式API...');
-      
-      const response = await fetch(streamUrl, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(requestBody),
-        signal: AbortSignal.timeout(30000) // 30秒超时
-      });
-      
-      if (!response.ok) {
-        throw new Error(`流式API调用失败: HTTP ${response.status}`);
-      }
-      
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('无法获取响应流');
-      }
-      
-      const decoder = new TextDecoder();
-      let fullText = '';
-      let buffer = '';
-      
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          
-          if (done) break;
-          
-          const chunk = decoder.decode(value, { stream: true });
-          buffer += chunk;
-          
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-          
-          for (const line of lines) {
-            const trimmedLine = line.trim();
-            
-            if (!trimmedLine) continue;
-            
-            try {
-              const data = JSON.parse(trimmedLine);
-              
-              if (data.candidates && data.candidates[0]?.content?.parts?.[0]?.text) {
-                const newText = data.candidates[0].content.parts[0].text;
-                fullText = newText;
-                
-                if (onUpdate) {
-                  onUpdate(fullText);
-                }
-                
-                // 移除冗余日志：流式数据接收
-              }
-              
-              if (data.candidates && data.candidates[0]?.finishReason) {
-                break;
-              }
-            } catch (parseError) {
-              // 忽略JSON解析错误
-            }
-          }
-        }
-      } finally {
-        reader.releaseLock();
-      }
-      
-      if (fullText && fullText.trim()) {
-        return fullText.trim();
-      }
-      
-      throw new Error('流式API未返回有效数据');
-      
-    } catch (streamError) {
-      console.warn('流式API失败，降级到标准API:', streamError);
-      
-      // 6. 最终降级到标准API，但模拟流式效果
+      // 直连流式 / 标准 调用。MiniMax 不支持浏览器直连 (CORS),需要后端代理;
+      // 这里如果直连失败,getDirectProviderAnalysis 会抛出,外层会再次尝试 Gemini
+      // 风格的标准调用兜底。
+      const directText = await getDirectProviderAnalysis(activeProvider, activeApiKey, prompt, activeModel);
+      if (onUpdate) onUpdate(directText);
+      return directText;
+    } catch (directError) {
+      console.warn(`直连${activeProvider.displayName} 失败,降级到标准API:`, directError);
+
+      // 6. 最终降级到标准API(非流式),由前端模拟流式效果
       const result = await getAIAnalysis(divinationData, master, gameType, userInfo);
-      
-      // 模拟打字机效果
+
       if (onUpdate && result) {
         const words = result.split('');
         let currentText = '';
-        
+
         for (let i = 0; i < words.length; i++) {
           currentText += words[i];
           onUpdate(currentText);
-          
-          // 控制速度，每几个字符暂停一下
+
+          // 控制速度,每几个字符暂停一下
           if (i % 3 === 0) {
             await new Promise(resolve => setTimeout(resolve, 50));
           }
         }
       }
-      
+
       return result;
     }
-    
+
   } catch (error) {
     console.error('AI分析失败:', error);
     
@@ -689,17 +824,17 @@ export async function getAIAnalysis(
     
     // 2. 如果配置了服务器URL，优先使用后端服务器
     if (serverUrl && serverUrl.trim()) {
-      
+
       try {
         // 检查服务器健康状态
         const isServerHealthy = await checkServerHealth(serverUrl);
-        
+
         if (isServerHealthy) {
           console.log('后端服务器健康检查通过，使用服务器API...');
           // 构建提示词
           const prompt = buildPrompt(master, divinationData, gameType, userInfo);
-          // 对于非流式分析，强制使用标准API
-          return await getServerAnalysis(serverUrl, prompt, false);
+          // 对于非流式分析，强制使用标准API，路由由 callServerAnalysis 决定
+          return await callServerAnalysis(serverUrl, prompt, false);
         } else {
           console.warn('后端服务器健康检查失败，降级到直接API调用');
         }
@@ -707,72 +842,29 @@ export async function getAIAnalysis(
         console.warn('后端服务器调用失败，降级到直接API调用:', serverError);
       }
     }
-    
+
     // 3. 验证API密钥（只有在没有可用服务器时才强制要求）
-    const effectiveApiKey = getActiveApiKey(apiKey);
-    if (!hasValidApiKey(apiKey)) {
+    const { provider: activeProvider, apiKey: activeApiKey, model: activeModel } = resolveActiveProvider();
+    if (!activeApiKey || !activeProvider.isValidApiKeyFormat(activeApiKey)) {
       if (serverUrl && serverUrl.trim()) {
-        throw new Error('后端服务器不可用，且未配置有效的Gemini API密钥。请检查服务器状态或配置API密钥。');
+        throw new Error(`后端服务器不可用，且未配置有效的 ${activeProvider.displayName} API 密钥。请检查服务器状态或配置 API 密钥。`);
       } else {
-        throw new Error('请先在设置中配置有效的Gemini API密钥');
+        throw new Error(`请先在设置中配置有效的 ${activeProvider.displayName} API 密钥`);
       }
     }
-    
+
     // 4. 验证大师对象
     if (!isValidMaster(master)) {
       throw new Error('大师配置无效');
     }
-    
+
     // 5. 构建提示词
     const prompt = buildPrompt(master, divinationData, gameType, userInfo);
     console.log('构建的提示词:', prompt);
-    
-    // 6. 构建API请求
-    const apiUrl = buildGeminiApiUrl(GEMINI_CONFIG.MODELS.PRIMARY, apiKey);
-    const requestBody = {
-      contents: [
-        {
-          parts: [
-            {
-              text: prompt
-            }
-          ]
-        }
-      ],
-      generationConfig: GEMINI_CONFIG.GENERATION_CONFIG
-    };
-    
-    console.log('正在调用Gemini API...');
-    
-    // 7. 调用Gemini API
-    const response = await axios.post<GeminiResponse>(apiUrl, requestBody, {
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      timeout: GEMINI_CONFIG.REQUEST_CONFIG.TIMEOUT
-    });
-    
-    // 8. 解析响应
-    const data = response.data;
-    
-    if (!data.candidates || data.candidates.length === 0) {
-      throw new Error('API返回数据格式错误：没有候选结果');
-    }
-    
-    const candidate = data.candidates[0];
-    if (!candidate.content || !candidate.content.parts || candidate.content.parts.length === 0) {
-      throw new Error('API返回数据格式错误：没有内容部分');
-    }
-    
-    const analysisText = candidate.content.parts[0].text;
-    
-    if (!analysisText || analysisText.trim() === '') {
-      throw new Error('API返回的分析结果为空');
-    }
-    
-    console.log('AI分析成功完成');
-    return analysisText.trim();
-    
+
+    // 6. 直连 provider（MiniMax 在浏览器无 CORS 时会失败,由调用方处理降级）
+    console.log(`正在调用 ${activeProvider.displayName} API...`);
+    return await getDirectProviderAnalysis(activeProvider, activeApiKey, prompt, activeModel);
   } catch (error) {
     console.error('AI分析失败:', error);
     
@@ -1356,7 +1448,7 @@ export async function validateGeminiApiKey(apiKey: string): Promise<boolean> {
 
   } catch (error) {
     console.error('API Key验证失败:', error);
-    
+
     if (axios.isAxiosError(error)) {
       if (error.response) {
         const status = error.response.status;
@@ -1374,12 +1466,12 @@ export async function validateGeminiApiKey(apiKey: string): Promise<boolean> {
         throw new Error('网络连接失败，请检查网络连接');
       }
     }
-    
+
     // 处理超时错误
     if (error instanceof Error && 'code' in error && error.code === 'ECONNABORTED') {
       throw new Error('验证请求超时，请检查网络连接后重试');
     }
-    
+
     // 重新抛出其他错误
     if (error instanceof Error) {
       throw error;
@@ -1387,6 +1479,55 @@ export async function validateGeminiApiKey(apiKey: string): Promise<boolean> {
       throw new Error('验证失败，请检查网络连接');
     }
   }
+}
+
+/**
+ * Validate an API key for the *currently active* provider. Routes to the
+ * right upstream depending on settings.provider. Falls back to a tiny
+ * inference: gemini via direct REST, others via backend /api/llm/validate-key
+ * (which is preferred because it doesn't require the browser to reach the
+ * upstream directly).
+ */
+export async function validateProviderKey(
+  providerId: string,
+  apiKey: string,
+  serverUrl?: string
+): Promise<boolean> {
+  const provider = getProviderCfg(providerId);
+  const trimmedKey = (apiKey || '').trim();
+  if (!provider.isValidApiKeyFormat(trimmedKey)) {
+    throw new Error(`API Key格式不正确（${provider.displayName}）`);
+  }
+
+  // Prefer the backend probe when a server is configured.
+  if (serverUrl && serverUrl.trim()) {
+    const response = await fetch(`${serverUrl.replace(/\/$/, '')}/api/llm/validate-key`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider: provider.id, apiKey: trimmedKey }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (response.ok) return true;
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data?.error || `后端验证失败: HTTP ${response.status}`);
+  }
+
+  // Browser-side direct probe.
+  if (provider.id === 'gemini') {
+    return await validateGeminiApiKey(trimmedKey);
+  }
+  if (provider.id === 'minimax') {
+    const url = `${provider.directBaseUrl.replace(/\/$/, '')}/models`;
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: { ...provider.directAuthHeader(trimmedKey) },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (resp.ok) return true;
+    const text = await resp.text().catch(() => '');
+    throw new Error(`MiniMax 验证失败: HTTP ${resp.status} ${text.slice(0, 200)}`);
+  }
+  throw new Error('未实现的 provider 验证');
 }
 
 /**
