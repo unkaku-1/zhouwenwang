@@ -15,9 +15,15 @@ interface StreamingMarkdownProps {
  */
 const preprocessStreamingMarkdown = (content: string, isStreaming: boolean): string => {
   if (!content) return '';
-  
+
   let processedContent = content;
-  
+
+  // 某些模型（DeepSeek-V3 / MiniMax-M3 等）会在正式回答前输出
+  // <think>...</think> 推理块。这个块不是给用户看的，react-markdown
+  // 把它当未识别内联 HTML 处理时会被丢弃或显示为乱码，所以我们
+  // 在这里显式剥掉。匹配不区分大小写，且容许多行 / 跨行内容。
+  processedContent = processedContent.replace(/<think>[\s\S]*?<\/think>/gi, '');
+
   // 如果正在流式输入，处理可能不完整的内容
   if (isStreaming) {
     // 确保未闭合的代码块不会影响渲染

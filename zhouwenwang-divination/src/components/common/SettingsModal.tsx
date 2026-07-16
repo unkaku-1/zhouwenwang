@@ -5,13 +5,14 @@
 
 import React, { useState, useEffect, Fragment } from 'react';
 import { Dialog, Transition } from '@headlessui/react';
-import { Settings, X, Key, Trash2, Save, Download, Upload, AlertTriangle, User, Check } from 'lucide-react';
+import { Settings, X, Key, Trash2, Save, Download, Upload, AlertTriangle, User, Check, Cpu } from 'lucide-react';
 import { useStore, useMaster } from '../../core/store';
 import { clearAllData, exportSettings, importSettings, exportDivinationRecords } from '../../core/settings';
 import { getStorageInfo } from '../../core/storage';
 import { MasterSelector } from '../../masters/MasterSelector';
 import { API_CONFIG, hasValidApiKey, isValidApiKeyFormat } from '../../masters/config';
-import { validateGeminiApiKey } from '../../masters/service';
+import { validateGeminiApiKey, validateProviderKey } from '../../masters/service';
+import { LLM_PROVIDER_LIST, getProvider } from '../../masters/providers';
 import { getDefaultServerUrl } from '../../utils/url';
 import { 
   baseStyles, 
@@ -37,7 +38,10 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const { selectedMaster, setSelectedMaster } = useMaster();
   
   // 本地状态
+  const [providerId, setProviderId] = useState<string>(settings.provider || 'gemini');
   const [apiKey, setApiKey] = useState(settings.apiKey);
+  const [providerApiKey, setProviderApiKey] = useState(settings.providerApiKey || '');
+  const [providerModel, setProviderModel] = useState(settings.providerModel || '');
   const [serverUrl, setServerUrl] = useState(settings.serverUrl || getDefaultServerUrl());
   const [isLoading, setIsLoading] = useState(false);
   const [isTestingServer, setIsTestingServer] = useState(false);
@@ -50,10 +54,13 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
   // 当设置变化时更新本地状态
   useEffect(() => {
+    setProviderId(settings.provider || 'gemini');
     setApiKey(settings.apiKey);
+    setProviderApiKey(settings.providerApiKey || '');
+    setProviderModel(settings.providerModel || '');
     setServerUrl(settings.serverUrl || getDefaultServerUrl());
     setStorageInfo(getStorageInfo());
-  }, [settings.apiKey, settings.serverUrl]);
+  }, [settings.provider, settings.apiKey, settings.providerApiKey, settings.providerModel, settings.serverUrl]);
 
 
 
@@ -69,11 +76,19 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   const saveApiConfigInternal = async (successMessage?: string): Promise<boolean> => {
     try {
       const trimmedKey = apiKey.trim();
+      const trimmedProviderKey = providerApiKey.trim();
       const trimmedServerUrl = serverUrl.trim();
+      const trimmedModel = providerModel.trim();
 
-      // 验证API密钥格式
-      if (trimmedKey && !isValidApiKeyFormat(trimmedKey)) {
-        setError('API密钥格式无效，请检查输入');
+      // 验证当前 provider 的 key 格式（如果填了）
+      const activeProvider = getProvider(providerId);
+      if (trimmedProviderKey && !activeProvider.isValidApiKeyFormat(trimmedProviderKey)) {
+        setError(`${activeProvider.displayName} 密钥格式无效，请检查输入`);
+        return false;
+      }
+      // Gemini 旧字段后向兼容校验（仅在未填 providerApiKey 时校验）
+      if (providerId === 'gemini' && trimmedKey && !isValidApiKeyFormat(trimmedKey)) {
+        setError('Gemini 密钥格式无效，请检查输入');
         return false;
       }
 
@@ -88,18 +103,21 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
       }
 
       // 更新设置
-      const result = await updateSettings({ 
+      const result = await updateSettings({
+        provider: providerId as any,
         apiKey: trimmedKey,
-        serverUrl: trimmedServerUrl || undefined
+        providerApiKey: trimmedProviderKey,
+        providerModel: trimmedModel,
+        serverUrl: trimmedServerUrl || undefined,
       });
-      
+
       if (!result.success) {
         setError(result.error || '保存配置失败');
         return false;
       }
 
       setSuccess(successMessage || 'API配置已保存');
-      
+
       // 2秒后清除成功消息
       setTimeout(() => {
         setSuccess(null);
@@ -114,30 +132,35 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
   };
 
   /**
-   * 测试API密钥
+   * 测试API密钥 — 按当前 provider 路由
    */
   const handleTestApiKey = async () => {
     try {
       setIsTestingApiKey(true);
       clearMessages();
 
-      const trimmedKey = apiKey.trim();
-      
+      const activeProvider = getProvider(providerId);
+      const trimmedKey = (providerId === 'gemini' ? apiKey : providerApiKey).trim();
+
       if (!trimmedKey) {
         setError('请输入API密钥');
         return;
       }
 
-      // 使用service中的统一验证函数
-      await validateGeminiApiKey(trimmedKey);
-      
-      setSuccess('API密钥验证成功！正在保存...');
-      console.log('API密钥验证通过');
-      
+      // 使用 service 中的统一验证函数
+      if (providerId === 'gemini' && !trimmedKey.startsWith('AIza')) {
+        // 旧 UI 行为：保持 Gemini 旧路径
+        await validateGeminiApiKey(trimmedKey);
+      } else {
+        await validateProviderKey(providerId, trimmedKey, serverUrl);
+      }
+
+      setSuccess(`${activeProvider.displayName} 密钥验证成功！正在保存...`);
+      console.log(`${activeProvider.displayName} 密钥验证通过`);
+
       // 验证成功后自动保存API配置
-      const saved = await saveApiConfigInternal('API密钥验证成功 已配置');
+      const saved = await saveApiConfigInternal(`${activeProvider.displayName} 密钥验证成功 已配置`);
       if (!saved) {
-        // 如果保存失败，覆盖错误信息为更友好的提示
         setError('API密钥验证成功，但自动保存失败');
       }
     } catch (error) {
@@ -414,6 +437,54 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
             {/* API配置标签页 */}
             {activeTab === 'api' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+                {/* Provider 选择 */}
+                <div style={baseStyles.card()}>
+                  <label style={textStyles.label}>
+                    <Cpu className="h-4 w-4" style={{ color: colors.primary }} />
+                    <span>LLM 提供方 (Provider)</span>
+                  </label>
+                  <p style={textStyles.description}>
+                    选择用于占卜解读的模型来源。MiniMax 提供 MiniMax / MiniMax 系列模型，支持国产化与中文优化。
+                  </p>
+                  <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '12px' }}>
+                    {LLM_PROVIDER_LIST.map((p) => (
+                      <button
+                        key={p.id}
+                        type="button"
+                        onClick={() => setProviderId(p.id)}
+                        {...presetStyles.buttonWithHover(
+                          providerId === p.id ? 'primary' : 'secondary',
+                          false,
+                          { flex: '1 1 200px', justifyContent: 'center' }
+                        )}
+                      >
+                        {providerId === p.id ? '✓ ' : ''}{p.displayName}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Model 选择 */}
+                  {(() => {
+                    const p = getProvider(providerId);
+                    return (
+                      <>
+                        <label htmlFor="providerModel" style={textStyles.label}>
+                          <span style={{ fontSize: '12px', color: colors.gray[400] }}>模型</span>
+                        </label>
+                        <select
+                          id="providerModel"
+                          value={providerModel || p.defaultModel}
+                          onChange={(e) => setProviderModel(e.target.value)}
+                          {...presetStyles.inputWithEffects()}
+                        >
+                          {p.models.map((m) => (
+                            <option key={m.id} value={m.id}>{m.label}</option>
+                          ))}
+                        </select>
+                      </>
+                    );
+                  })()}
+                </div>
                 {/* API密钥配置状态 */}
                 {API_CONFIG.GEMINI_API_KEY && API_CONFIG.GEMINI_API_KEY.trim().length > 0 && (
                   <div style={{
@@ -436,10 +507,10 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                 <div style={baseStyles.card()}>
                   <label htmlFor="serverUrl" style={textStyles.label}>
                     <Settings className="h-4 w-4" style={{ color: colors.primary }} />
-                    <span>Gemini响应服务器URL（优先）</span>
+                    <span>后端服务器URL（优先，代理所有 Provider 请求）</span>
                   </label>
                   <p style={textStyles.description}>
-                    配置后端服务器URL以代理Gemini API请求，避免Key泄露。
+                    配置后端服务器URL以代理 LLM API 请求，避免 Key 泄露。必填 MiniMax。
                   </p>
                   <div style={{ display: 'flex', gap: '10px' }}>
                     <input
@@ -465,39 +536,57 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
                   <label htmlFor="apiKey" style={textStyles.label}>
                     <Key className="h-4 w-4" style={{ color: colors.primary }} />
                     <span>
-                      {API_CONFIG.GEMINI_API_KEY && API_CONFIG.GEMINI_API_KEY.trim().length > 0 
-                        ? 'Gemini API密钥（备用配置）' 
-                        : 'Gemini API密钥'
-                      }
+                      {(() => {
+                        const ap = getProvider(providerId);
+                        return ap.id === 'gemini'
+                          ? (API_CONFIG.GEMINI_API_KEY && API_CONFIG.GEMINI_API_KEY.trim().length > 0
+                              ? 'Gemini API密钥（备用配置）'
+                              : 'Gemini API密钥')
+                          : `${ap.displayName} API 密钥`;
+                      })()}
                     </span>
                   </label>
-                  {!API_CONFIG.GEMINI_API_KEY || API_CONFIG.GEMINI_API_KEY.trim().length === 0 ? (
-                    <p style={textStyles.description}>
-                    暂时只支持Gemini
-                      {serverUrl.trim() && '如果配置了服务器URL且无需API密钥，此处可留空。'}
-                    </p>
-                  ) : (
-                    <p style={textStyles.description}>
-                      当前正在使用配置文件中的API密钥，此处配置仅作为备用。
-                    </p>
-                  )}
+                  {(() => {
+                    const ap = getProvider(providerId);
+                    if (ap.id === 'gemini') {
+                      if (!API_CONFIG.GEMINI_API_KEY || API_CONFIG.GEMINI_API_KEY.trim().length === 0) {
+                        return (
+                          <p style={textStyles.description}>
+                            支持 Gemini 系列模型。如果配置了服务器URL且无需API密钥，此处可留空。
+                          </p>
+                        );
+                      }
+                      return (
+                        <p style={textStyles.description}>
+                          当前正在使用配置文件中的 API 密钥，此处配置仅作为备用。
+                        </p>
+                      );
+                    }
+                    return (
+                      <p style={textStyles.description}>
+                        在此填入您的 {ap.displayName} 密钥。建议同时配置后端服务器URL，由后端代理请求以避免密钥泄露。
+                      </p>
+                    );
+                  })()}
                   <div style={{ display: 'flex', gap: '10px', marginBottom: '16px' }}>
                     <input
                       id="apiKey"
                       type="text"
-                      value={apiKey}
-                      onChange={(e) => setApiKey(e.target.value)}
-                      placeholder="请输入您的Gemini API密钥"
+                      value={providerId === 'gemini' ? apiKey : providerApiKey}
+                      onChange={(e) =>
+                        providerId === 'gemini' ? setApiKey(e.target.value) : setProviderApiKey(e.target.value)
+                      }
+                      placeholder={getProvider(providerId).keyPlaceholder}
                       {...presetStyles.inputWithEffects()}
                     />
                     <button
                       onClick={handleTestApiKey}
-                      disabled={isTestingApiKey || !apiKey.trim()}
-                      {...presetStyles.buttonWithHover('secondary', isTestingApiKey || !apiKey.trim(), { 
+                      disabled={isTestingApiKey || !(providerId === 'gemini' ? apiKey : providerApiKey).trim()}
+                      {...presetStyles.buttonWithHover('secondary', isTestingApiKey || !(providerId === 'gemini' ? apiKey : providerApiKey).trim(), {
                         whiteSpace: 'nowrap',
-                        background: isTestingApiKey || !apiKey.trim() 
+                        background: (isTestingApiKey || !(providerId === 'gemini' ? apiKey : providerApiKey).trim())
                           ? 'linear-gradient(90deg, #6B7280 0%, #4B5563 100%)'
-                          : 'linear-gradient(90deg, #059669 0%, #047857 100%)'
+                          : 'linear-gradient(90deg, #059669 0%, #047857 100%)',
                       })}
                     >
                       {isTestingApiKey ? '验证中...' : '验证密钥'}

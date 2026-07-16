@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import Sidebar from './Sidebar';
 import MainContent from './MainContent';
@@ -14,6 +14,16 @@ const Layout: React.FC = () => {
   const { clearError } = useUI();
   const location = useLocation();
 
+  // Track viewport for responsive main-content offset
+  const [viewportWidth, setViewportWidth] = useState<number>(
+    typeof window !== 'undefined' ? window.innerWidth : 1280
+  );
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+
   // 路由变化时清除错误状态
   useEffect(() => {
     clearError();
@@ -26,7 +36,7 @@ const Layout: React.FC = () => {
       if (!settings.serverUrl) {
         try {
           console.log('初始化默认服务器URL设置...');
-          await updateSettings({ 
+          await updateSettings({
             serverUrl: getDefaultServerUrl()
           });
           console.log('默认服务器URL已设置');
@@ -35,7 +45,6 @@ const Layout: React.FC = () => {
         }
       }
     };
-
     initializeSettings();
   }, []); // 只在组件挂载时执行一次
 
@@ -46,7 +55,7 @@ const Layout: React.FC = () => {
         console.log('正在初始化大师列表...');
         const masters = await fetchMasters();
         setAvailableMasters(masters);
-        
+
         // 如果没有选中的大师，设置默认大师
         if (!selectedMaster) {
           const defaultMaster = getDefaultMaster(masters);
@@ -65,34 +74,47 @@ const Layout: React.FC = () => {
             }
           }
         }
-        
+
         // 调用初始化默认大师方法
         initializeDefaultMaster();
-        
+
       } catch (error) {
         console.error('初始化大师列表失败:', error);
       }
     };
-
     initializeMasters();
   }, []); // 只在组件挂载时执行一次
 
+  // Responsive main-content offset:
+  //  - mobile  (< 768px)  : full width, no left margin, top-bar reserves 56px
+  //  - tablet  (768-1023) : 80px (icon-only) sidebar offset
+  //  - desktop (>= 1024)  : 80px or 256px based on collapsed state
+  const isMobile = viewportWidth < 768;
+  const isTablet = viewportWidth >= 768 && viewportWidth < 1024;
+  const mainMarginLeft = isMobile
+    ? '0px'
+    : isTablet
+      ? '80px'
+      : (settings.sidebarCollapsed ? '80px' : '256px');
+  const mainPaddingTop = isMobile ? '56px' : '0px';
+
   return (
     <div className="bg-black min-h-screen">
-      {/* 移动端检测组件 - 最高优先级 */}
+      {/* 移动端轻量提示 */}
       <MobileDetector />
-      
+
       {/* 跑马灯通知 - 全局覆盖 */}
       <MarqueeNotification apiBaseUrl={settings.serverUrl} />
-      
+
       {/* GitHub 链接 - 固定在右上角 */}
       <GitHubLink />
-      
+
       <Sidebar />
-      <div 
+      <div
         className="transition-all duration-300 ease-in-out"
-        style={{ 
-          marginLeft: settings.sidebarCollapsed ? '80px' : '256px'
+        style={{
+          marginLeft: mainMarginLeft,
+          paddingTop: mainPaddingTop
         }}
       >
         <MainContent isCollapsed={settings.sidebarCollapsed} />

@@ -220,6 +220,12 @@ app.get('/api/health', (req, res) => {
   }
 });
 
+// 1b. Provider-routed LLM routes (multi-provider: gemini + minimax + ...)
+// Mounted before the legacy /api/gemini/* routes; existing routes are
+// preserved for back-compat with the original client code.
+const llmRouter = require('./routes/llm');
+app.use('/api/llm', llmRouter);
+
 // 2. 🌟 流式文本生成（重点功能）
 app.post('/api/gemini/stream', async (req, res) => {
   

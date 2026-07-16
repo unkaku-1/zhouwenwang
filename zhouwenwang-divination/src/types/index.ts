@@ -84,11 +84,17 @@ export interface Game {
  * 存储用户的应用程序配置
  */
 export interface Settings {
-  /** Gemini API密钥 */
+  /** Active LLM provider. Defaults to 'gemini' for back-compat. */
+  provider?: 'gemini' | 'minimax';
+  /** Gemini API密钥 (kept for back-compat; new code uses providerApiKey + provider) */
   apiKey: string;
+  /** API key for the *active* non-gemini provider. Optional; empty = use env. */
+  providerApiKey?: string;
+  /** Model id for the active provider. Optional; defaults to provider default. */
+  providerModel?: string;
   /** 侧边栏是否折叠 */
   sidebarCollapsed: boolean;
-  /** Gemini响应服务器URL（可选，用于代理请求） */
+  /** 后端服务器URL（可选，用于代理请求） */
   serverUrl?: string;
 }
 
