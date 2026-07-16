@@ -285,18 +285,18 @@ const Sidebar: React.FC<SidebarProps> = ({ className }) => {
       {/* SIDEBAR */}
       <motion.div
         className={`
-          bg-black border-r border-[#333333] flex flex-col transition-all duration-300 ease-in-out z-50
-          ${isMobile
-            ? `fixed left-0 top-0 h-screen ${isMobileOpen ? '' : '-translate-x-full'}`
-            : 'fixed left-0 top-0 h-screen'
-          }
+          bg-black border-r border-[#333333] flex flex-col z-50
+          ${isMobile ? 'fixed left-0 top-0 h-screen' : 'fixed left-0 top-0 h-screen'}
           ${className || ''}
         `}
         style={{
           width: isMobile ? '280px' : (effectiveCollapsed ? '80px' : '256px')
         }}
-        layout
-        transition={{ duration: 0.3 }}
+        initial={false}
+        animate={{
+          x: isMobile ? (isMobileOpen ? 0 : -300) : 0
+        }}
+        transition={{ duration: 0.3, ease: 'easeInOut' }}
       >
         {/* Header */}
         <div className={`p-4 border-b border-[#333333] flex items-center ${effectiveCollapsed && !isMobile ? 'justify-center' : 'justify-between'}`}>

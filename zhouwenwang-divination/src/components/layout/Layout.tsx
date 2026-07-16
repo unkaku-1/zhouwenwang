@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useLocation } from 'react-router-dom';
 import Sidebar from './Sidebar';
 import MainContent from './MainContent';
-import { MarqueeNotification, GitHubLink, MobileDetector, SettingsFab } from '../common';
+import { MarqueeNotification, GitHubLink, MobileDetector } from '../common';
 import { useSettings, useMaster, useUI, useStore } from '../../core/store';
 import { fetchMasters, getDefaultMaster } from '../../masters/service';
 import { getDefaultServerUrl } from '../../utils/url';
@@ -108,9 +108,6 @@ const Layout: React.FC = () => {
 
       {/* GitHub 链接 - 固定在右上角 */}
       <GitHubLink />
-
-      {/* 浮动设置按钮 - 移动端右下角,始终可见 */}
-      <SettingsFab />
 
       <Sidebar />
       <div

@@ -80,9 +80,10 @@ const minimaxProvider: LLMProviderConfig = {
   displayName: 'MiniMax (MiniMax)',
   envKey: 'MINIMAX_API_KEY',
   keyPlaceholder: 'eyJ... MiniMax API Key',
-  defaultModel: 'MiniMax-M2.7',
+  defaultModel: 'MiniMax-M3',
   models: [
-    { id: 'MiniMax-M2.7', label: 'MiniMax-M2.7 (推荐, 高质量)' },
+    { id: 'MiniMax-M3', label: 'MiniMax-M3 (推荐, 最新)' },
+    { id: 'MiniMax-M2.7', label: 'MiniMax-M2.7' },
     { id: 'MiniMax-M2.5', label: 'MiniMax-M2.5' },
     { id: 'MiniMax-M2.1', label: 'MiniMax-M2.1' },
   ],
